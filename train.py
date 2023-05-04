@@ -41,7 +41,6 @@ def main(args, train_params):
         model = T5FineTuner(args)
     elif args.model_mode == "grcl":
         model = T5NegFineTuner(args)
-        train_params["num_sanity_val_steps"] = 0
 
         
     total_params = sum(p.numel() for p in model.parameters())
@@ -79,7 +78,7 @@ def main(args, train_params):
     return args.output_dir
 
 if __name__ == "__main__":
-    os.environ["CUDA_VISIBLE_DEVICES"]="2"
+    #os.environ["CUDA_VISIBLE_DEVICES"]="2"
     parser = ArgumentParser()
     parser.add_argument("--config", default=None, required=True, type=str)
     arg_ = parser.parse_args()
@@ -111,6 +110,7 @@ if __name__ == "__main__":
         tensorboard_project=hparam.tensorboard_project,
         tensorboard_run_name=hparam.tensorboard_run_name,
 
+        swap=hparam.swap,
         max_input_length=hparam.max_input_length,
         max_output_length=hparam.max_output_length,
         max_beamsearch_length=hparam.max_beamsearch_length,
@@ -119,6 +119,8 @@ if __name__ == "__main__":
         learning_rate=hparam.learning_rate,
         lr_scheduler=hparam.lr_scheduler,
         accelerator=hparam.accelerator,
+        fp_16=hparam.fp_16,
+        use_ib_negatives=hparam.use_ib_negatives,
         num_train_epochs=hparam.num_train_epochs,
         train_batch_size=hparam.train_batch_size,
         eval_batch_size=hparam.eval_batch_size,
@@ -173,15 +175,14 @@ if __name__ == "__main__":
 
     if args.accelerator == "ddp":
         plugins = DDPStrategy(find_unused_parameters=False)
-        fp_16 = False
-        args.fp16 = False
+        #fp_16 = False
+        #args.fp16 = False
         if torch.cuda.current_device() == 0:
             print(f"@@@ Using DDP without FP16")
     elif args.accelerator == "deepspeed":
         plugins = DeepSpeedStrategy(stage=2, load_full_weights=True)
-        
-        fp_16 = True
-        args.fp16 = True
+        #fp_16 = True
+        #args.fp16 = True
         if torch.cuda.current_device() == 0:
             print(f"@@@ Using Deepspeed stage2 with FP16")
     else:
@@ -192,7 +193,7 @@ if __name__ == "__main__":
         gpus=args.n_gpu,
         strategy=plugins,
         max_epochs=args.num_train_epochs,
-        precision=16 if fp_16 else 32,
+        precision=16 if args.fp_16 else 32,
         default_root_dir=args.output_dir,
         logger=tensorboard_logger,
         check_val_every_n_epoch=args.check_val_every_n_epoch,

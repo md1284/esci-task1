@@ -6,7 +6,6 @@ import copy
 import ujson
 import pandas as pd
 import random
-random.seed(12345)
 
 from tqdm import tqdm
 from collections import defaultdict
@@ -43,7 +42,7 @@ def ids_to_text(generated_ids, tokenizer):
 def psg_to_pids(path):
     psg_to_pids = {}
     pid_to_psg = {}
-    white_psg = []
+    empty_string_pids = []
 
     with open(path) as f:
         #for line_idx, line in tqdm(enumerate(f)):
@@ -54,7 +53,7 @@ def psg_to_pids(path):
                 if len(line.strip().split('\t')) == 1:
                     pid = line.strip()
                     passage = ""
-                    white_psg.append(pid)
+                    empty_string_pids.append(pid)
                 else:
                     assert False
             assert pid == 'id' or int(pid) == line_idx
@@ -62,7 +61,7 @@ def psg_to_pids(path):
                 psg_to_pids[passage] = []
             psg_to_pids[passage].append(int(pid))
             pid_to_psg[int(pid)] = passage
-    print(f"white_psg: {len(white_psg)}")
+    print(f"empty_string_pids: {len(empty_string_pids)}")
     return psg_to_pids, pid_to_psg
 
 class GENREDataset(Dataset):
@@ -103,7 +102,8 @@ class GENREDataset(Dataset):
             )
 
         self.tokenizer = tokenizer
-        self.sentence_dict = {}
+        self.input_sentence_dict = {}
+        self.output_sentence_dict = {}
 
     def __len__(self):
         return self.len
@@ -185,17 +185,17 @@ class GENREDataset(Dataset):
         else:
             raise NotImplementedError(f"Inappropriate qrels type: {type_}")
             
-        if input_ not in self.sentence_dict.keys():
+        if input_ not in self.input_sentence_dict.keys():
             source = self._get_ids(input_, max_length=self.hparams.max_input_length)
-            self.sentence_dict[input_] = source
+            self.input_sentence_dict[input_] = source
         else:
-            source = self.sentence_dict[input_]
+            source = self.input_sentence_dict[input_]
 
-        if output_ not in self.sentence_dict.keys():
+        if output_ not in self.output_sentence_dict.keys():
             target = self._get_ids(output_, max_length=self.hparams.max_output_length)
-            self.sentence_dict[output_] = target
+            self.output_sentence_dict[output_] = target
         else:
-            target = self.sentence_dict[output_]
+            target = self.output_sentence_dict[output_]
 
         assert (
             len(source["input_ids"].squeeze()) == self.hparams.max_input_length
@@ -248,9 +248,12 @@ class GENRETriplesDataset(Dataset):
             raise NotImplementedError(f"Inappropriate split type: {split}")
 
         self.queries = self._load_queries(os.path.join(self.hparams.dataset, self.hparams.queries))
-        self.collection = self._load_collection(os.path.join(self.hparams.dataset, self.hparams.collection))
+        self.collection, self.empty_string_pids = self._load_collection(os.path.join(self.hparams.dataset, self.hparams.collection))
 
-        self.dataset = self._load_triples(os.path.join(self.hparams.dataset, data_path))
+        if split == "train":
+            self.dataset = self._load_triples(os.path.join(self.hparams.dataset, data_path))
+        else:
+            self.dataset = self._load_qrels_all_val(os.path.join(self.hparams.dataset, data_path))
         self.len = len(self.dataset)
 
         if torch.cuda.current_device() == 0:
@@ -259,18 +262,13 @@ class GENRETriplesDataset(Dataset):
             )
 
         self.tokenizer = tokenizer
-        self.sentence_dict = {}
+        self.input_sentence_dict = {}
+        self.output_sentence_dict = {}
 
     def __len__(self):
         return self.len
 
     def _load_datapair(self, path):
-        """
-        NOTE: For distributed sampling, this isn't equivalent to perfectly uniform sampling.
-        In particular, each subset is perfectly represented in every batch! However, since we never
-        repeat passes over the data, we never repeat any particular triple, and the split across
-        nodes is random (since the underlying file is pre-shuffled), there's no concern here.
-        """
         if torch.cuda.current_device() == 0:
             print(f"@@@ Loading datapair...")
         data = {"input": [], "output": [], "type": []}
@@ -284,13 +282,18 @@ class GENRETriplesDataset(Dataset):
                 data["type"].append(type_)
         return data
 
+    def _load_qrels_all_val(self, path):
+        if torch.cuda.current_device() == 0:
+            print("@@@ Loading qrels_all_val...")
+        
+        dataset = []
+        with open(path) as f:
+            for line_idx, line in enumerate(f):
+                qid, pid, label = line.strip().split("\t")
+                dataset.append([int(qid), int(pid), int(label)])
+        return dataset
+
     def _load_triples(self, path):
-        """
-        NOTE: For distributed sampling, this isn't equivalent to perfectly uniform sampling.
-        In particular, each subset is perfectly represented in every batch! However, since we never
-        repeat passes over the data, we never repeat any particular triple, and the split across
-        nodes is random (since the underlying file is pre-shuffled), there's no concern here.
-        """
         if torch.cuda.current_device() == 0:
             print("@@@ Loading triples...")
 
@@ -318,6 +321,7 @@ class GENRETriplesDataset(Dataset):
         if torch.cuda.current_device() == 0:
             print(f"@@@ Loading collection...")
         collection = []
+        empty_string_pids = []
 
         with open(path) as f:
             for line_idx, line in enumerate(f):
@@ -327,11 +331,12 @@ class GENRETriplesDataset(Dataset):
                     if len(line.strip().split('\t')) == 1:
                         pid = line.strip()
                         passage = ""
+                        empty_string_pids.append(int(pid))
                     else:
                         assert False
                 assert pid == 'id' or int(pid) == line_idx
                 collection.append(passage)
-        return collection
+        return collection, set(empty_string_pids)
 
     def _get_ids(self, s, max_length):
         ids = self.tokenizer.batch_encode_plus(
@@ -354,25 +359,36 @@ class GENRETriplesDataset(Dataset):
         elif type_ == 1: # passage -> query
             input_ = self.collection[input_]
             output_ = self.queries[output_]
+        elif type_ == 2: # passage -> passage
+            input_ = self.collection[input_]
+            output_ = self.collection[output_]
         else:
             raise NotImplementedError(f"Inappropriate qrels type: {type_}")
             
-        if input_ not in self.sentence_dict.keys():
+        input_ = "<extra_id_0> " + input_
+        output_ = "<extra_id_1> " + output_
+
+        if input_ not in self.input_sentence_dict.keys():
             source = self._get_ids(input_, max_length=self.hparams.max_input_length)
-            self.sentence_dict[input_] = source
+            self.input_sentence_dict[input_] = source
         else:
-            source = self.sentence_dict[input_]
+            source = self.input_sentence_dict[input_]
 
-        if output_ not in self.sentence_dict.keys():
+        if output_ not in self.output_sentence_dict.keys():
             target = self._get_ids(output_, max_length=self.hparams.max_output_length)
-            self.sentence_dict[output_] = target
+            self.output_sentence_dict[output_] = target
         else:
-            target = self.sentence_dict[output_]
+            target = self.output_sentence_dict[output_]
 
+        #if torch.sum(source['attention_mask']).item:
+        #    print(f"source: {source}")
+        #if torch.isnan(target['input_ids']).any() or torch.isnan(target['attention_mask']).any():
+        #    print(f"target: {target}")
+        
         assert (
             len(source["input_ids"].squeeze()) == self.hparams.max_input_length
             and len(target["input_ids"].squeeze()) == self.hparams.max_output_length
-        ), print(f"length of source: {len(source['input_ids'])}\nlength of attention:  {len(target['input_ids'])}")
+        ), print(f"length of source: {len(source['input_ids'])}\nlength of attention:  {len(target['input_ids'])}\ninput: {input_}\noutput: {output_}")
 
 
         if idx == 0 and torch.cuda.current_device() == 0:
@@ -385,18 +401,56 @@ class GENRETriplesDataset(Dataset):
 
         return source, target, input_, output_
 
-
     def random_sample(self, pids, k=1):
-        return random.sample(pids, k=k)
+        sampled = random.sample(pids, k=k)
+        while len(set(sampled) & self.empty_string_pids) > 0:
+            sampled = random.sample(pids, k=k)
+        return sampled
+    
+    def random_sample_nooverlap(self, pos, pids, k=1):
+        sampeld_pos = self.random_sample(pids, k=1)[0]
+        while sampeld_pos == pos:
+            sampeld_pos = self.random_sample(pids, k=1)[0]
+        return sampeld_pos
 
     def __getitem__(self, idx):
+        if self.split in ["validation", "test"]:
+            qid, pid, label = self.dataset[idx]
+            type_ = 0
+            source, target, input_, output_ = self.convert_to_features(qid, pid, type_, idx)
+            
+            source_ids = source["input_ids"].squeeze()
+            src_mask = source["attention_mask"].squeeze()
+            target_ids = target["input_ids"].squeeze()
+            target_mask = target["attention_mask"].squeeze()
+
+            return {
+                "source_ids": source_ids,
+                "target_ids": target_ids,
+
+                "source_mask": src_mask,
+                "target_mask": target_mask,
+
+                "input_": input_,
+                "output_": output_,
+                
+                "qid": qid,
+                "pid": pid,
+                "label": label,
+            }
+
+
         qid, pos_pids, neg_pids = self.dataset[idx]
         pos = self.random_sample(pos_pids)[0]
         neg = self.random_sample(neg_pids)[0]
+        type_ = 0
 
-        source, pos_target, input_, pos_output_ = self.convert_to_features(qid, pos, 0, idx)
-        source, neg_target, input_, neg_output_ = self.convert_to_features(qid, neg, 0, idx)
+        #if self.split == "train" and len(pos_pids) > 1 and random.randint(0,1) == 0:
+        #    qid = self.random_sample_nooverlap(pos, pos_pids, k=1)
+        #    type_ = 2
 
+        source, pos_target, input_, pos_output_ = self.convert_to_features(qid, pos, type_, idx)
+        source, neg_target, input_, neg_output_ = self.convert_to_features(qid, neg, type_, idx)
 
 
         source_ids = source["input_ids"].squeeze()
